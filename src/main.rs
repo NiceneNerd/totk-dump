@@ -1,7 +1,7 @@
 #![allow(irrefutable_let_patterns)]
 #![feature(let_chains)]
 use argh::FromArgs;
-use eyre::{bail, Context, ContextCompat, Result};
+use eyre::{bail, ContextCompat, Result};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use roead::{byml::Byml, sarc::Sarc};
@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     println,
 };
-use zstd::{bulk::Decompressor, dict::DecoderDictionary, Decoder};
+use zstd::bulk::Decompressor;
 
 const COMPRESSION_LEVEL: usize = 15;
 
@@ -69,27 +69,59 @@ impl Unpacker {
     }
 
     fn decompress(&self, name: &str, data: &[u8]) -> Result<Vec<u8>> {
-        if name.ends_with(".bcett.byml.zs") {
-            Ok(self
-                .map_decomp
-                .lock()
-                .decompress(data, data.len() * COMPRESSION_LEVEL)?)
+        let mut decompressor = if name.ends_with(".bcett.byml.zs") {
+            self.map_decomp.lock()
         } else if name.ends_with(".pack.zs") {
-            Ok(self
-                .pack_decomp
-                .lock()
-                .decompress(data, data.len() * COMPRESSION_LEVEL)?)
+            self.pack_decomp.lock()
         } else if name.ends_with(".rsizetable.zs") {
-            Ok(self
-                .default_decomp
-                .lock()
-                .decompress(data, data.len() * COMPRESSION_LEVEL)?)
+            self.default_decomp.lock()
         } else {
-            Ok(self
-                .common_decomp
-                .lock()
-                .decompress(data, data.len() * COMPRESSION_LEVEL)?)
+            self.common_decomp.lock()
+        };
+        let mut last_error = None;
+        for i in 2..(COMPRESSION_LEVEL * 2) {
+            match decompressor.decompress(data, data.len() * i) {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            }
         }
+        eyre::bail!("Failed to decompress. {last_error:?}")
+    }
+
+    fn write_byml(&self, mut data: Vec<u8>, relative: &Path) -> Result<()> {
+        let name = relative.file_name().map(|n| n.to_string_lossy()).unwrap();
+        if name.ends_with(".zs") {
+            data = self.decompress(&name, &data)?;
+        }
+        data[2] = 4;
+        match Byml::from_binary(&data) {
+            Ok(byml) => {
+                let out = self.output.join(relative).with_extension("yml");
+                out.parent().map(fs::create_dir_all).transpose()?;
+                match serde_yaml::to_string(&byml) {
+                    Ok(text) => fs::write(out, text)?,
+                    Err(_) => println!(
+                        "WARNING: Could not dump {} to YAML.",
+                        relative.display(),
+                        // byml
+                    ),
+                }
+            }
+            Err(e) => {
+                println!(
+                    "WARNING: Failed to parse {}. Reason: {}",
+                    relative.display(),
+                    e
+                );
+                let out = self.output.join(relative);
+                out.parent().map(fs::create_dir_all).transpose()?;
+                fs::write(out, data)?;
+            }
+        }
+        Ok(())
     }
 
     fn unpack(&self) -> Result<()> {
@@ -105,26 +137,22 @@ impl Unpacker {
                     .context("Bad filename")?;
                 let relative = file.strip_prefix(&self.source).unwrap();
                 if name.ends_with(".byml.zs") || name.ends_with(".bgyml") {
-                    let mut data = fs::read(&file)?;
-                    if name.ends_with(".zs") {
-                        data = self.decompress(name, &data)?;
-                    }
-                    match Byml::from_binary(data) {
-                        Ok(byml) => {
-                            let out = self.output.join(relative).with_extension("yml");
-                            out.parent().map(fs::create_dir_all).transpose()?;
-                            fs::write(out, byml.to_text().unwrap())?;
-                        }
-                        Err(e) => {
-                            println!(
-                                "WARNING: Failed to parse {}. Reason: {}",
-                                relative.display(),
-                                e
-                            );
-                        }
-                    }
+                    let data = fs::read(&file)?;
+                    self.write_byml(data, relative)?;
                 } else if name.ends_with(".pack.zs") {
-                    println!("TODO");
+                    let data = self.decompress(name, &fs::read(&file)?)?;
+                    let sarc = Sarc::new(data)?;
+                    for file in sarc.files().filter(|f| f.name().is_some()) {
+                        let name = file.unwrap_name();
+                        if name.ends_with(".byml.zs") || name.ends_with(".bgyml") {
+                            let data = file.data().to_vec();
+                            self.write_byml(data, &relative.join(name))?;
+                        } else {
+                            let out = self.output.join(relative).join(name);
+                            out.parent().map(fs::create_dir_all).transpose()?;
+                            fs::write(out, file.data())?;
+                        }
+                    }
                 }
                 Ok(())
             })?;
