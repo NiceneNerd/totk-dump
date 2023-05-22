@@ -2,6 +2,7 @@
 #![feature(let_chains)]
 use argh::FromArgs;
 use eyre::{bail, ContextCompat, Result};
+use indicatif::ParallelProgressIterator;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use roead::{byml::Byml, sarc::Sarc};
@@ -96,7 +97,11 @@ impl Unpacker {
         if name.ends_with(".zs") {
             data = self.decompress(&name, &data)?;
         }
-        data[2] = 4;
+        match &data[..2] {
+            b"BY" => data[3] = 4,
+            b"YB" => data[2] = 2,
+            _ => return Ok(()),
+        };
         match Byml::from_binary(&data) {
             Ok(byml) => {
                 let out = self.output.join(relative).with_extension("yml");
@@ -116,7 +121,10 @@ impl Unpacker {
                     relative.display(),
                     e
                 );
-                let out = self.output.join(relative);
+                let mut out = self.output.join(relative);
+                if name.ends_with(".zs") {
+                    out.set_extension("");
+                }
                 out.parent().map(fs::create_dir_all).transpose()?;
                 fs::write(out, data)?;
             }
@@ -125,10 +133,14 @@ impl Unpacker {
     }
 
     fn unpack(&self) -> Result<()> {
-        jwalk::WalkDir::new(&self.source)
+        let files = jwalk::WalkDir::new(&self.source)
             .into_iter()
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .par_bridge()
+            .collect::<Vec<_>>();
+        let len = files.len();
+        files
+            .into_par_iter()
+            .progress_count(len as u64)
             .try_for_each(|file| -> Result<()> {
                 let name = file
                     .file_name()
@@ -139,7 +151,7 @@ impl Unpacker {
                 if name.ends_with(".byml.zs") || name.ends_with(".bgyml") {
                     let data = fs::read(&file)?;
                     self.write_byml(data, relative)?;
-                } else if name.ends_with(".pack.zs") {
+                } else if name.ends_with(".pack.zs") || name.ends_with(".sarc.zs") {
                     let data = self.decompress(name, &fs::read(&file)?)?;
                     let sarc = Sarc::new(data)?;
                     for file in sarc.files().filter(|f| f.name().is_some()) {
@@ -147,6 +159,30 @@ impl Unpacker {
                         if name.ends_with(".byml.zs") || name.ends_with(".bgyml") {
                             let data = file.data().to_vec();
                             self.write_byml(data, &relative.join(name))?;
+                        } else if file.is_aamp() {
+                            let pio = roead::aamp::ParameterIO::from_binary(file.data)?;
+                            let out = self.output.join(relative).join(name).with_extension("yml");
+                            out.parent().map(fs::create_dir_all).transpose()?;
+                            fs::write(out, serde_yaml::to_string(&pio)?)?;
+                        } else if file.data.starts_with(b"MsgStdBn") {
+                            match msyt::Msyt::from_msbt_bytes(file.data)
+                                .map_err(|e| e.chain().rev().fold(eyre::eyre!("Failed to parse MSBT"), |acc, e| acc.wrap_err(eyre::eyre!("{e}"))))
+                            {
+                                Ok(msbt) => {
+                                    let out =
+                                        self.output.join(relative).join(name).with_extension("yml");
+                                    out.parent().map(fs::create_dir_all).transpose()?;
+                                    match serde_yaml::to_string(&msbt) {
+                                        Ok(text) => fs::write(out, text)?,
+                                        Err(e) => {
+                                            println!("WARNING: Failed to dump MSBT file to YAML. Error: {e:?}.")
+                                        }
+                                    };
+                                }
+                                Err(e) => println!(
+                                    "WARNING: Failed to parse MSBT file {name}. Error: {e:?}."
+                                ),
+                            }
                         } else {
                             let out = self.output.join(relative).join(name);
                             out.parent().map(fs::create_dir_all).transpose()?;
@@ -163,7 +199,6 @@ impl Unpacker {
 
 fn main() -> Result<()> {
     let args: UnpackArgs = argh::from_env();
-    dbg!(&args);
     let mut source = args.source.canonicalize()?;
     if !source.exists() {
         bail!("Source directory does not exist");
@@ -192,6 +227,7 @@ fn main() -> Result<()> {
     let output = args
         .output
         .unwrap_or_else(|| std::env::current_dir().unwrap().join("unpacked"));
+    println!("Unpacking ROM to {}…", output.display());
     Unpacker::new(source, output).init_dicts()?.unpack()?;
     Ok(())
 }
