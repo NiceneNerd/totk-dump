@@ -11,6 +11,6 @@ jwalk = "0.8.1"
 msyt = { git = "https://github.com/NiceneNerd/msyt", rev = "12e4d95fb6480f445284f37706db7bfa8351dc06" }
 parking_lot = "0.12.1"
 rayon = "1.7.0"
-roead = { path = "../roead", features = ["with-serde"] }
+roead = { version = "0.23.0", features = ["with-serde"] }
 serde_yaml = "0.9.21"
 zstd = "0.12.3+zstd.1.5.2"
